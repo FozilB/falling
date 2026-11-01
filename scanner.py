@@ -6,6 +6,9 @@
             как только одна из них закрылась ниже минимума звезды;
   свеча 3 - остатки движения: сообщений уже не будет.
 
+Бот ищет падающую и вечернюю звезду (правила как в индикаторе TradingView): виды задаются в config.py
+(FALLING_* и EVENING_*), в сообщении указано, какая именно звезда найдена.
+
 Если в настройках STAR_ALERT = True, сообщение «звезда найдена» приходит сразу при обнаружении звезды
 (не дожидаясь падения), а сообщение «падение началось» - вторым шагом.
 
@@ -203,15 +206,63 @@ def send(text):
 
 # ---------------------------------------------------------------- Звезда
 
+def green_before(cs, i, body):
+    """Перед свечой cs[i] большая зелёная свеча, а тело самой свечи заметно меньше: признак вечерней звезды.
+    Возвращает (да/нет, тело зелёной свечи, среднее тело за 20 свечей до неё)."""
+    p = cs[i - 1]
+    p_body = p["c"] - p["o"]
+    avg_body = mean([abs(x["c"] - x["o"]) for x in cs[i - 21:i - 1]])
+    ok = (p_body > 0 and p_body >= avg_body * getattr(C, "PREV_GREEN_BODY_MULT", 1.0)
+          and body <= p_body * getattr(C, "STAR_BODY_VS_PREV_MAX", 0.7))
+    return ok, p_body, avg_body
+
+
+def get_patterns():
+    """Какие звёзды ищет бот.
+    Конфиг на оба вида (есть FALLING_* и EVENING_*): падающая и вечерняя ищутся в одном боте, правила как в индикаторе.
+    Старый конфиг с PATTERN = "...": ищется один вид звезды, как раньше."""
+    if hasattr(C, "PATTERN"):
+        evening = C.PATTERN == "evening_star"
+        return [{"kind": C.PATTERN, "title": C.TITLE, "emoji": C.EMOJI,
+                 "upper_min": C.UPPER_WICK_MIN, "body_max": C.BODY_MAX,
+                 "lower_min": getattr(C, "LOWER_WICK_MIN", 0.0), "lower_max": C.LOWER_WICK_MAX,
+                 "need_green": evening,
+                 "skip_green": (not evening) and getattr(C, "NOT_AFTER_BIG_GREEN", False)}]
+    out = []
+    if C.FALLING_ENABLED:
+        out.append({"kind": "shooting_star", "title": "Падающая звезда", "emoji": "🌠",
+                    "upper_min": C.FALLING_UPPER_WICK_MIN, "body_max": C.FALLING_BODY_MAX,
+                    "lower_min": 0.0, "lower_max": C.FALLING_LOWER_WICK_MAX,
+                    "need_green": False, "skip_green": C.FALLING_SKIP_AFTER_BIG_GREEN})
+    if C.EVENING_ENABLED:
+        out.append({"kind": "evening_star", "title": "Вечерняя звезда", "emoji": "🌇",
+                    "upper_min": C.EVENING_UPPER_WICK_MIN, "body_max": C.EVENING_BODY_MAX,
+                    "lower_min": C.EVENING_LOWER_WICK_MIN, "lower_max": C.EVENING_LOWER_WICK_MAX,
+                    "need_green": C.EVENING_REQUIRE_GREEN, "skip_green": False})
+    return out
+
+
+def title_of(w):
+    return w.get("title") or getattr(C, "TITLE", "Звезда")
+
+
+def emoji_of(w):
+    return w.get("emoji") or getattr(C, "EMOJI", "⭐")
+
+
 def star_info(cs, i):
-    """Проверка свечи cs[i] (закрытой). cs - только закрытые свечи, от старых к новым."""
+    """Проверка свечи cs[i] (закрытой). cs - только закрытые свечи, от старых к новым.
+    Возвращает описание звезды (с видом: падающая или вечерняя) или None."""
     c = cs[i]
     rng = c["h"] - c["l"]
     if rng <= 0:
         return None
     top, bottom = max(c["o"], c["c"]), min(c["o"], c["c"])
     body, upper, lower = top - bottom, c["h"] - top, bottom - c["l"]
-    if not (upper / rng > C.UPPER_WICK_MIN and body / rng < C.BODY_MAX and lower / rng < C.LOWER_WICK_MAX):
+    fits = [p for p in get_patterns()
+            if upper / rng > p["upper_min"] and body / rng < p["body_max"]
+            and p["lower_min"] <= lower / rng < p["lower_max"]]
+    if not fits:
         return None
     if C.REQUIRE_RED_BODY and not c["c"] < c["o"]:
         return None
@@ -224,19 +275,20 @@ def star_info(cs, i):
     vol_mult = c["v"] / avg_vol if avg_vol > 0 else None
     if C.MIN_VOLUME_MULT > 0 and (vol_mult is None or vol_mult < C.MIN_VOLUME_MULT):
         return None
-    extra = {}
-    if C.PATTERN == "evening_star":
-        p = cs[i - 1]
-        p_body = p["c"] - p["o"]
-        avg_body = mean([abs(x["c"] - x["o"]) for x in cs[i - 21:i - 1]])
-        if p_body <= 0 or p_body < avg_body * getattr(C, "PREV_GREEN_BODY_MULT", 1.0):
-            return None
-        if body > p_body * getattr(C, "STAR_BODY_VS_PREV_MAX", 0.7):
-            return None
-        extra = {"prev_mult": p_body / avg_body if avg_body > 0 else None,
-                 "star_vs_prev": body / p_body * 100}
-    return {"upper_pct": upper / rng * 100, "body_pct": body / rng * 100, "vol_mult": vol_mult,
-            "rsi_star": rsi([x["c"] for x in cs[:i + 1]]), **extra}
+    big_green, p_body, avg_body = green_before(cs, i, body)
+    for p in fits:  # формы видов не пересекаются; если пересеклись из-за настроек, берётся первый подходящий
+        if p["need_green"] and not big_green:
+            continue
+        if p["skip_green"] and big_green:
+            continue  # такая свеча - вечерняя звезда, о ней пишет другой бот
+        extra = {}
+        if p["need_green"]:
+            extra = {"prev_mult": p_body / avg_body if avg_body > 0 else None,
+                     "star_vs_prev": body / p_body * 100}
+        return {"kind": p["kind"], "title": p["title"], "emoji": p["emoji"],
+                "upper_pct": upper / rng * 100, "body_pct": body / rng * 100, "vol_mult": vol_mult,
+                "rsi_star": rsi([x["c"] for x in cs[:i + 1]]), **extra}
+    return None
 
 
 def level_of(w):
@@ -264,7 +316,7 @@ def build_message(w, c, bar, close_ts, ctx):
     cur = ctx["cur"]
 
     lines = [
-        f"{C.EMOJI} <b>{C.TITLE}</b> · {base}/USDT",
+        f"{emoji_of(w)} <b>{title_of(w)}</b> · {base}/USDT",
         "",
         f"Цена сейчас: {price(cur)} ({fmt_hm(ctx['now'])}, Ташкент)",
         f"Звезда: {star_tf}, закрылась {fmt_time(w['ts'] + TF_MS[w['tf']])}",
@@ -277,7 +329,7 @@ def build_message(w, c, bar, close_ts, ctx):
     if w.get("rsi_star") is not None:
         rsi_parts.append(f"на звезде {star_tf} — {rsi_text(w['rsi_star'])}")
     if ctx.get("rsi_now") is not None:
-        rsi_parts.append(f"сейчас на 15м — {rsi_text(ctx['rsi_now'])}")
+        rsi_parts.append(f"сейчас на {TF_RU[ctx.get('rsi_bar', '15m')]} — {rsi_text(ctx['rsi_now'])}")
     if rsi_parts:
         lines.append("RSI(14): " + ", ".join(rsi_parts))
 
@@ -309,12 +361,12 @@ def build_star_message(w, cur, now):
     star_tf = TF_RU[w["tf"]]
     level = level_of(w)
     level_name = "минимума звезды" if C.CONFIRM_LEVEL == "low" else "низа тела звезды"
-    url = f"https://www.tradingview.com/chart/?symbol=OKX:{base}USDT.P&interval={TV_INTERVAL['15m']}"
+    url = f"https://www.tradingview.com/chart/?symbol=OKX:{base}USDT.P&interval={TV_INTERVAL[min(C.CONFIRM_TIMEFRAMES, key=TF_MS.get)]}"
     end = w["ts"] + 2 * TF_MS[w["tf"]]
     confirm_tfs = " или ".join(TF_RU[b] for b in C.CONFIRM_TIMEFRAMES)
 
     lines = [
-        f"{C.EMOJI} <b>{C.TITLE}</b> · {base}/USDT",
+        f"{emoji_of(w)} <b>{title_of(w)}</b> · {base}/USDT",
         "",
         "Звезда найдена, падение ещё не началось.",
         "",
@@ -430,7 +482,7 @@ def scan_new_stars(state, now, stats, new_keys):
                                    "l": c["l"], "c": c["c"], **info}
             new_keys.add(key)
             found += 1
-            log(f"  звезда: {inst} {tf}")
+            log(f"  звезда: {inst} {tf} ({info['title']})")
             if getattr(C, "STAR_ALERT", True):
                 # цена сейчас - закрытие последней (формирующейся) свечи этого же запроса
                 cur = cs[-1]["c"]
@@ -506,8 +558,9 @@ def check_watch(state, now, stats, only=None):
             del state["watch"][key]
             stats["cooldown"] += 1
             continue
-        ctx = {"cur": cs[-1]["c"], "now": now_ms(),
-               "rsi_now": rsi([x["c"] for x in cs]),
+        rsi_bar = min(C.CONFIRM_TIMEFRAMES, key=TF_MS.get)
+        ctx = {"cur": cs[-1]["c"], "now": now_ms(), "rsi_bar": rsi_bar,
+               "rsi_now": rsi([x["c"] for x in series[rsi_bar]]),
                "vol_break": vol_mult_at(series[bar], c["ts"])}
         if send(build_message(w, c, bar, close_ts, ctx)):
             state["last_alert"][w["inst"]] = now
@@ -520,7 +573,7 @@ def check_watch(state, now, stats, only=None):
 
 def main():
     if "--test" in sys.argv or os.environ.get("TEST_TELEGRAM") == "1":
-        ok = send(f"✅ {C.TITLE}: бот на связи. Сообщения о звёздах будут приходить сюда.")
+        ok = send(f"✅ {getattr(C, 'TITLE', 'Падающая и вечерняя звезда')}: бот на связи. Сообщения о звёздах будут приходить сюда.")
         log("Тестовое сообщение отправлено" if ok else "Тестовое сообщение НЕ отправлено")
         sys.exit(0 if ok else 1)
 
