@@ -306,7 +306,7 @@ def breakdown(c, w):
 
 # ---------------------------------------------------------------- Сообщение
 
-def build_message(w, c, bar, close_ts, ctx):
+def build_message(w, c, bar, close_ts, ctx, stage="final"):
     """ctx: cur - цена сейчас, now - время запроса, rsi_now, vol_break."""
     base = w["inst"].split("-")[0]
     level = level_of(w)
@@ -317,6 +317,8 @@ def build_message(w, c, bar, close_ts, ctx):
 
     lines = [
         f"{emoji_of(w)} <b>{title_of(w)}</b> · {base}/USDT",
+        ("⚠️ <b>РАННЕЕ ПОДТВЕРЖДЕНИЕ 15м</b> — дождитесь финального закрытия 30м."
+         if stage == "early" else "✅ <b>ФИНАЛЬНОЕ ПОДТВЕРЖДЕНИЕ 30м</b>"),
         "",
         f"Цена сейчас: {price(cur)} ({fmt_hm(ctx['now'])}, Ташкент)",
         f"Звезда: {star_tf}, закрылась {fmt_time(w['ts'] + TF_MS[w['tf']])}",
@@ -501,14 +503,16 @@ def scan_new_stars(state, now, stats, new_keys):
 
 
 def check_watch(state, now, stats, only=None):
-    first_close = min(TF_MS[b] for b in C.CONFIRM_TIMEFRAMES)
+    early_tf = min(C.CONFIRM_TIMEFRAMES, key=TF_MS.get)
+    final_tf = max(C.CONFIRM_TIMEFRAMES, key=TF_MS.get)
+    first_close = TF_MS[early_tf]
     for key, w in list(state["watch"].items()):
         if only is not None and key not in only:
             continue
         tf_ms = TF_MS[w["tf"]]
         start, end = w["ts"] + tf_ms, w["ts"] + 2 * tf_ms  # окно = свеча 2
         if now < start + first_close:
-            continue  # в свече 2 ещё не закрылась ни одна свеча 15м/30м, запрос не нужен
+            continue
 
         cs = fetch_candles(w["inst"], "15m", CANDLES)
         events, series = [], {}
@@ -518,58 +522,101 @@ def check_watch(state, now, stats, only=None):
             series = {"15m": cs, "30m": to_30m(cs)}
             for bar in C.CONFIRM_TIMEFRAMES:
                 ltf = TF_MS[bar]
-                for c in series.get(bar, []):
-                    if c["closed"] and c["ts"] >= start and c["ts"] + ltf <= end:
-                        events.append((c["ts"] + ltf, bar, c))
-        events.sort(key=lambda e: (e[0], e[1]))
+                for candle in series.get(bar, []):
+                    if candle["closed"] and candle["ts"] >= start and candle["ts"] + ltf <= end:
+                        events.append((candle["ts"] + ltf, bar, candle))
+        events.sort(key=lambda event: (event[0], event[1]))
 
-        outcome = None
-        for close_ts, bar, c in events:
-            if c["c"] > w["h"]:
-                outcome = ("cancel", close_ts, bar, c)
-                break
-            if breakdown(c, w):
-                outcome = ("confirm", close_ts, bar, c)
-                break
-
-        if outcome is None:
-            if (cs is not None and now >= end + 20 * 60_000) or now >= end + tf_ms:
-                log(f"  {w['inst']} {w['tf']}: свеча 2 закончилась без падения, снимаю с наблюдения")
+        # If the 30m candle is already confirmed, send the final alert only.
+        final_already_confirmed = any(
+            bar == final_tf and breakdown(candle, w)
+            for _, bar, candle in events
+        )
+        closed = False
+        for close_ts, bar, candle in events:
+            if candle["c"] > w["h"]:
+                if w.get("early_sent"):
+                    send(
+                        f"⚪ <b>Предварительное подтверждение отменено</b>\n"
+                        f"{w['inst'].split('-')[0]}/USDT · закрытие выше максимума звезды."
+                    )
+                log(f"  {w['inst']} {w['tf']}: закрытие выше максимума звезды, сценарий отменён")
                 del state["watch"][key]
-                stats["expired"] += 1
-            continue
+                stats["cancelled"] += 1
+                closed = True
+                break
+            if not breakdown(candle, w):
+                continue
 
-        kind, close_ts, bar, c = outcome
-        if kind == "cancel":
-            log(f"  {w['inst']} {w['tf']}: закрытие выше максимума звезды, сценарий отменён")
-            del state["watch"][key]
-            stats["cancelled"] += 1
-            continue
+            is_final = bar == final_tf
+            if not is_final:
+                if w.get("early_sent") or final_already_confirmed:
+                    continue
+                if close_ts < now_ms() - TF_MS[early_tf]:
+                    log(f"  {w['inst']} {w['tf']}: ранний пробой устарел, жду итог 30м без предварительного сообщения")
+                    continue
 
-        rng = w["h"] - w["l"]
-        if level_of(w) - c["c"] > C.MAX_CHASE_RANGES * rng:
-            log(f"  {w['inst']} {w['tf']}: падение уже ушло слишком далеко, не отправляю")
-            del state["watch"][key]
-            stats["too_late"] += 1
-            continue
-        last = state["last_alert"].get(w["inst"])
-        if last and now - last < C.COIN_COOLDOWN_HOURS * 3_600_000:
-            log(f"  {w['inst']}: по этой монете недавно уже было сообщение, пропускаю")
-            del state["watch"][key]
-            stats["cooldown"] += 1
-            continue
-        rsi_bar = min(C.CONFIRM_TIMEFRAMES, key=TF_MS.get)
-        ctx = {"cur": cs[-1]["c"], "now": now_ms(), "rsi_bar": rsi_bar,
-               "rsi_now": rsi([x["c"] for x in series[rsi_bar]]),
-               "vol_break": vol_mult_at(series[bar], c["ts"])}
-        if send(build_message(w, c, bar, close_ts, ctx)):
-            state["last_alert"][w["inst"]] = now
-            del state["watch"][key]
-            stats["sent"] += 1
-            log(f"  ОТПРАВЛЕНО: {w['inst']} (звезда {w['tf']}, начало на {bar})")
-        else:
-            stats["send_failed"] += 1
+            rng = w["h"] - w["l"]
+            level = level_of(w)
+            if level - candle["c"] > C.MAX_CHASE_RANGES * rng:
+                log(f"  {w['inst']} {w['tf']}: закрытие свечи ушло слишком далеко, не отправляю")
+                if is_final:
+                    del state["watch"][key]
+                    stats["too_late"] += 1
+                    closed = True
+                    break
+                continue
 
+            alert_key = f"{w['inst']}|{w['tf']}"
+            last = state["last_alert"].get(alert_key, state["last_alert"].get(w["inst"]))
+            if last and now - last < C.COIN_COOLDOWN_HOURS * 3_600_000:
+                log(f"  {w['inst']} {w['tf']}: cooldown, пропускаю сигнал")
+                del state["watch"][key]
+                stats["cooldown"] += 1
+                closed = True
+                break
+
+            current_price = cs[-1]["c"]
+            current_distance = level - current_price
+            if current_price >= level or current_distance > C.MAX_CHASE_RANGES * rng:
+                log(f"  {w['inst']} {w['tf']}: текущая цена уже не у уровня пробоя, не отправляю запоздавшее уведомление")
+                if is_final:
+                    del state["watch"][key]
+                    stats["too_late"] += 1
+                    closed = True
+                    break
+                continue
+
+            rsi_bar = early_tf
+            ctx = {"cur": current_price, "now": now_ms(), "rsi_bar": rsi_bar,
+                   "rsi_now": rsi([x["c"] for x in series[rsi_bar]]),
+                   "vol_break": vol_mult_at(series[bar], candle["ts"])}
+            stage = "final" if is_final else "early"
+            if send(build_message(w, candle, bar, close_ts, ctx, stage=stage)):
+                if is_final:
+                    state["last_alert"][alert_key] = now
+                    del state["watch"][key]
+                    stats["sent"] += 1
+                    log(f"  ОТПРАВЛЕНО (финал): {w['inst']} (звезда {w['tf']}, подтверждение {bar})")
+                    closed = True
+                    break
+                w["early_sent"] = True
+                stats["early_sent"] += 1
+                log(f"  ОТПРАВЛЕНО (раннее 15м): {w['inst']} (звезда {w['tf']})")
+            else:
+                stats["send_failed"] += 1
+
+        if closed:
+            continue
+        if not closed and ((cs is not None and now >= end + 20 * 60_000) or now >= end + tf_ms):
+            if w.get("early_sent"):
+                send(
+                    f"ℹ️ <b>Итогового подтверждения 30м не было</b>\n"
+                    f"{w['inst'].split('-')[0]}/USDT · окно этой звезды завершилось."
+                )
+            log(f"  {w['inst']} {w['tf']}: свеча 2 закончилась без финального подтверждения, снимаю с наблюдения")
+            del state["watch"][key]
+            stats["expired"] += 1
 
 def main():
     if "--test" in sys.argv or os.environ.get("TEST_TELEGRAM") == "1":
@@ -580,7 +627,7 @@ def main():
     state = load_state()
     now = now_ms()
     stats = {"scanned": {}, "failed": 0, "found": 0, "errors": 0, "expired": 0, "cancelled": 0,
-             "too_late": 0, "cooldown": 0, "sent": 0, "star_sent": 0, "send_failed": 0}
+             "too_late": 0, "cooldown": 0, "sent": 0, "early_sent": 0, "star_sent": 0, "send_failed": 0}
     new_keys = set()
     try:
         check_watch(state, now, stats)                      # 1) срочно: звёзды, найденные раньше
@@ -592,7 +639,7 @@ def main():
         save_state(state)
     log(f"Итог: проверено монет {stats['scanned'] or 'новых свечей нет'}, ошибок запросов {stats['failed']}, "
         f"новых звёзд {stats['found']} (объявлено {stats['star_sent']}), на наблюдении {len(state['watch'])}, "
-        f"падений отправлено {stats['sent']}, "
+        f"ранних уведомлений {stats['early_sent']}, финальных подтверждений {stats['sent']}, "
         f"отменено {stats['cancelled']}, не успели {stats['expired']}, слишком поздно {stats['too_late']}, "
         f"повтор по монете {stats['cooldown']}, время работы {(time.time() - T0) / 60:.1f} мин")
     if stats["send_failed"]:
