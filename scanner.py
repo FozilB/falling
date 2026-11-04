@@ -213,7 +213,8 @@ def fetch_candles(inst, bar, limit):
 
 
 def top_instruments():
-    """Самые оборотистые USDT-перпетуалы OKX."""
+    """USDT-перпетуалы OKX, которые стоит проверять: достаточно ликвидные и (если включено) растущие за сутки.
+    Самые оборотистые идут первыми; не больше TOP_COINS штук. None - список получить не удалось."""
     data = okx_get("/api/v5/market/tickers", {"instType": "SWAP"})
     time.sleep(PAUSE)
     if not data:
@@ -224,12 +225,28 @@ def top_instruments():
         if not inst.endswith("-USDT-SWAP") or inst in C.EXCLUDE:
             continue
         try:
-            turnover = float(d["volCcy24h"]) * float(d["last"])
+            last = float(d["last"])
+            turnover = float(d["volCcy24h"]) * last
         except (KeyError, ValueError, TypeError):
             continue
-        rows.append((turnover, inst))
-    rows.sort(reverse=True)
-    return [inst for _, inst in rows[:C.TOP_COINS]]
+        try:  # изменение цены за 24 часа, %; берётся из того же ответа биржи, лишних запросов нет
+            open24 = float(d["open24h"])
+            change = (last / open24 - 1) * 100 if open24 > 0 else None
+        except (KeyError, ValueError, TypeError):
+            change = None
+        rows.append((turnover, inst, change))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    all_n = len(rows)
+    rows = [r for r in rows if r[0] >= cfg("MIN_TURNOVER_USDT", 0)]
+    liquid_n = len(rows)
+    if cfg("ONLY_RISING", False):
+        min_change = cfg("MIN_24H_CHANGE_PCT", 0.0)
+        rows = [r for r in rows if r[2] is not None and r[2] >= min_change]
+        log(f"Монет всего {all_n}, с оборотом от {cfg('MIN_TURNOVER_USDT', 0):,.0f} USDT за сутки {liquid_n}, "
+            f"из них выросло за сутки не меньше чем на {min_change:g}%: {len(rows)} (проверяю не больше {C.TOP_COINS})")
+    else:
+        log(f"Монет всего {all_n}, с достаточным оборотом {liquid_n} (проверяю не больше {C.TOP_COINS})")
+    return [inst for _, inst, _ in rows[:C.TOP_COINS]]
 
 
 # ---------------------------------------------------------------- Telegram
@@ -565,7 +582,7 @@ def scan_new_stars(state, now, stats, new_keys):
             continue  # новая свеча этого ТФ ещё не закрылась
         if insts is None:
             insts = top_instruments()
-            if not insts:
+            if insts is None:  # пустой список - не ошибка: просто ни одна монета не прошла отбор
                 log("Не удалось получить список монет")
                 stats["errors"] += 1
                 return
