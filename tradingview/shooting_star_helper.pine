@@ -1,0 +1,170 @@
+//@version=5
+indicator("Shooting Star Strategy Helper v3 (RSI ≥ 70)", overlay=true, max_lines_count=50, max_labels_count=100)
+
+// ───── Тренд
+G1 = "Тренд"
+trendPeriod      = input.int(20, "Период SMA", minval=1, group=G1)
+requireRisingSMA = input.bool(true, "Требовать растущую SMA", group=G1)
+minBarsAbove     = input.int(3, "Мин. баров подряд выше SMA", minval=0, group=G1)
+requireLocalHigh = input.bool(true, "Звезда обновляет локальный максимум", group=G1)
+highLookback     = input.int(10, "Окно локального максимума", minval=2, group=G1)
+showSMA          = input.bool(false, "Показывать SMA", group=G1)
+
+// ───── Свеча
+G2 = "Свеча"
+bodyMaxPct  = input.float(35, "Макс. тело, % диапазона", minval=1, maxval=100, group=G2) / 100
+upperMinPct = input.float(50, "Мин. верхняя тень, % диапазона", minval=1, maxval=100, group=G2) / 100
+lowerMaxPct = input.float(15, "Макс. нижняя тень, % диапазона", minval=0, maxval=100, group=G2) / 100
+upperToBody = input.float(2.0, "Верхняя тень ≥ N × тело", minval=0, step=0.5, group=G2)
+atrLen      = input.int(14, "Период ATR", minval=1, group=G2)
+minRangeAtr = input.float(0.5, "Мин. размер свечи, × ATR", minval=0, step=0.1, group=G2)
+
+// ───── RSI
+G4 = "RSI"
+useRsi         = input.bool(true, "Использовать RSI-фильтр", group=G4)
+rsiLen         = input.int(14, "Период RSI", minval=2, group=G4)
+rsiOverbought  = input.float(70, "Порог RSI (ниже не учитывать)", minval=50, maxval=100, group=G4)
+rsiLookback    = input.int(1, "Окно проверки RSI, свечей (1 = только звезда)", minval=1, group=G4)
+requireRsiTurn = input.bool(true, "На подтверждении RSI должен падать", group=G4)
+useDivergence  = input.bool(false, "Требовать медвежью дивергенцию", group=G4)
+showRsiLabel   = input.bool(true, "Показывать RSI на звезде", group=G4)
+
+// ───── Сделка
+G3 = "Сделка"
+confirmationBars = input.int(1, "Свечей на подтверждение", minval=1, group=G3)
+riskReward       = input.float(1.5, "Риск/Прибыль (RR)", minval=0.5, step=0.1, group=G3)
+stopBufferAtr    = input.float(0.1, "Буфер стопа, × ATR", minval=0, step=0.05, group=G3)
+showStats        = input.bool(true, "Показывать статистику", group=G3)
+
+// ───── Расчёты
+bc        = barstate.isconfirmed
+atr       = ta.atr(atrLen)
+ma        = ta.sma(close, trendPeriod)
+barsAbove = nz(ta.barssince(close <= ma), 999)
+prevHigh  = ta.highest(high, highLookback)[1]
+
+// RSI
+rsi         = ta.rsi(close, rsiLen)
+rsiHot      = ta.highest(rsi, rsiLookback) >= rsiOverbought
+prevRsiPeak = ta.highest(rsi, highLookback)[1]
+divergence  = high >= prevHigh and rsi < prevRsiPeak
+
+rsiOk = not useRsi or rsiHot
+divOk = not useDivergence or divergence
+
+trendOk = close > ma
+     and (not requireRisingSMA or ma > ma[1])
+     and barsAbove >= minBarsAbove
+localHighOk = not requireLocalHigh or high >= prevHigh
+
+bodySize    = math.abs(close - open)
+candleRange = high - low
+upperShadow = high - math.max(open, close)
+lowerShadow = math.min(open, close) - low
+
+shapeOk = candleRange > 0
+     and candleRange >= atr * minRangeAtr
+     and bodySize <= candleRange * bodyMaxPct
+     and upperShadow >= candleRange * upperMinPct
+     and upperShadow >= bodySize * upperToBody
+     and lowerShadow <= candleRange * lowerMaxPct
+
+isStar = bc and trendOk and localHighOk and shapeOk and rsiOk and divOk
+
+// ───── Состояние
+var float starHigh = na
+var float starLow  = na
+var int   starBar  = na
+var bool  pending  = false
+
+var bool  inTrade = false
+var float tEntry  = na
+var float tSL     = na
+var float tTP     = na
+var int   tBar    = na
+var int   wins    = 0
+var int   losses  = 0
+
+var line entLine = na
+var line slLine  = na
+var line tpLine  = na
+
+bool confirmed   = false
+bool tradeClosed = false
+bool tradeWon    = false
+
+rsiTurnOk = not useRsi or not requireRsiTurn or rsi < rsi[1]
+
+if bc
+    // 1. Сопровождение открытой сделки
+    if inTrade and bar_index > tBar
+        hitSL = high >= tSL
+        hitTP = low <= tTP
+        if hitSL or hitTP
+            tradeWon := hitTP and not hitSL   // SL и TP в одной свече = убыток
+            tradeClosed := true
+            inTrade := false
+            if tradeWon
+                wins += 1
+            else
+                losses += 1
+            for l in array.from(entLine, slLine, tpLine)
+                line.set_extend(l, extend.none)
+                line.set_x2(l, bar_index)
+
+    // 2. Ожидание подтверждения
+    if pending and bar_index > starBar
+        if close > starHigh                                // паттерн сломан
+            pending := false
+        else if close < starLow and rsiTurnOk              // подтверждение + разворот RSI
+            confirmed := true
+            pending := false
+        else if bar_index - starBar >= confirmationBars
+            pending := false                               // время вышло
+
+    // 3. Открытие сделки по подтверждённому сигналу
+    if confirmed and not inTrade
+        tEntry := close
+        tSL    := starHigh + atr * stopBufferAtr
+        tTP    := tEntry - (tSL - tEntry) * riskReward
+        tBar   := bar_index
+        inTrade := true
+        entLine := line.new(bar_index, tEntry, bar_index + 1, tEntry, extend=extend.right, color=color.blue,  style=line.style_dashed)
+        slLine  := line.new(bar_index, tSL,    bar_index + 1, tSL,    extend=extend.right, color=color.red)
+        tpLine  := line.new(bar_index, tTP,    bar_index + 1, tTP,    extend=extend.right, color=color.green)
+
+    // 4. Новый паттерн
+    if isStar
+        starHigh := high
+        starLow  := low
+        starBar  := bar_index
+        pending  := true
+        if showRsiLabel
+            label.new(bar_index, high, "RSI " + str.tostring(rsi, "0"),
+                 style=label.style_label_down, color=color.new(color.gray, 20),
+                 textcolor=color.white, size=size.tiny)
+
+// ───── Визуализация
+plotshape(isStar, "Shooting Star", style=shape.arrowdown, location=location.abovebar,
+     color=color.red, size=size.small, text="SS")
+plotshape(confirmed, "Подтверждённый сигнал", style=shape.labeldown, location=location.abovebar,
+     color=color.maroon, textcolor=color.white, size=size.tiny, text="SHORT")
+plot(showSMA ? ma : na, "SMA", color=color.orange)
+
+// ───── Статистика
+var table stats = table.new(position.top_right, 2, 4, border_width=1)
+if showStats and barstate.islast
+    total = wins + losses
+    table.cell(stats, 0, 0, "Сделок",  text_color=color.white, bgcolor=color.gray)
+    table.cell(stats, 1, 0, str.tostring(total), text_color=color.white, bgcolor=color.gray)
+    table.cell(stats, 0, 1, "Винрейт", text_color=color.white, bgcolor=color.gray)
+    table.cell(stats, 1, 1, total > 0 ? str.tostring(wins / total * 100, "0.0") + "%" : "—", text_color=color.white, bgcolor=color.gray)
+    table.cell(stats, 0, 2, "TP / SL", text_color=color.white, bgcolor=color.gray)
+    table.cell(stats, 1, 2, str.tostring(wins) + " / " + str.tostring(losses), text_color=color.white, bgcolor=color.gray)
+    table.cell(stats, 0, 3, "Итого, R", text_color=color.white, bgcolor=color.gray)
+    table.cell(stats, 1, 3, str.tostring(wins * riskReward - losses, "0.0#"), text_color=color.white, bgcolor=color.gray)
+
+// ───── Алерт: только момент формирования звезды (закрытие свечи)
+// Уведомления о подтверждении и закрытии сделки убраны намеренно.
+alertcondition(isStar, "Найдена падающая звезда",
+     "{{ticker}} {{interval}}: сформировалась падающая звезда (Shooting Star)")
