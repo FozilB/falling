@@ -1,16 +1,19 @@
-"""Сканер OKX: звезда на 1ч/4ч + начало падения на 15м/30м -> сообщение в Telegram.
+"""Сканер OKX: падающая звезда на 1ч/4ч -> сообщение в Telegram сразу после закрытия свечи.
 
-Схема по свечам (на старшем таймфрейме):
+Правила звезды перенесены из индикатора TradingView «Shooting Star Strategy Helper v3»:
+  форма свечи (тело, верхняя и нижняя тень, верхняя тень >= 2 тел), размер не меньше 0.5 ATR,
+  тренд (цена выше растущей SMA20, несколько свечей подряд выше неё), максимум звезды - локальный,
+  RSI(14) на звезде не ниже 70 (ниже - звезду не учитываем). Все числа - в config.py.
+
+По умолчанию (CONFIRM_ALERTS = False) бот присылает ТОЛЬКО сообщение «звезда сформировалась»:
+оно приходит, как только бот увидел закрытую свечу-звезду, без ожидания подтверждения.
+
+Если в настройках CONFIRM_ALERTS = True, работает прежняя схема по свечам (на старшем таймфрейме):
   свеча 1 - звезда;
   свеча 2 - основное движение: бот следит за ней по свечам 15м/30м и пишет,
             как только одна из них закрылась ниже минимума звезды;
   свеча 3 - остатки движения: сообщений уже не будет.
-
-Бот ищет падающую и вечернюю звезду (правила как в индикаторе TradingView): виды задаются в config.py
-(FALLING_* и EVENING_*), в сообщении указано, какая именно звезда найдена.
-
-Если в настройках STAR_ALERT = True, сообщение «звезда найдена» приходит сразу при обнаружении звезды
-(не дожидаясь падения), а сообщение «падение началось» - вторым шагом.
+Вечернюю звезду бот тоже умеет искать (EVENING_ENABLED в config.py), по умолчанию она выключена.
 
 Порядок работы одного запуска (из-за паузы между запросами поиск новых звёзд долгий):
   1) сначала проверка уже найденных звёзд (срочно),
@@ -72,23 +75,72 @@ def mean(xs):
 
 # ---------------------------------------------------------------- Индикаторы
 
-def rsi(closes, n=RSI_LEN):
-    """RSI по Уайлдеру (как в TradingView). None, если свечей мало."""
+def cfg(name, default):
+    """Настройка из config.py; если её там нет (старый config.py), берётся значение по умолчанию."""
+    return getattr(C, name, default)
+
+
+def _rsi_value(gain, loss):
+    if loss == 0:
+        return 50.0 if gain == 0 else 100.0
+    return 100.0 - 100.0 / (1.0 + gain / loss)
+
+
+def rsi_series(closes, n=RSI_LEN):
+    """RSI по Уайлдеру (как в TradingView) для каждой свечи. None, пока свечей не хватает."""
+    out = [None] * len(closes)
     if len(closes) < n + 1:
-        return None
+        return out
     gain = loss = 0.0
     for i in range(1, n + 1):
         d = closes[i] - closes[i - 1]
         gain += max(d, 0.0)
         loss += max(-d, 0.0)
     gain, loss = gain / n, loss / n
+    out[n] = _rsi_value(gain, loss)
     for i in range(n + 1, len(closes)):
         d = closes[i] - closes[i - 1]
         gain = (gain * (n - 1) + max(d, 0.0)) / n
         loss = (loss * (n - 1) + max(-d, 0.0)) / n
-    if loss == 0:
-        return 50.0 if gain == 0 else 100.0
-    return 100.0 - 100.0 / (1.0 + gain / loss)
+        out[i] = _rsi_value(gain, loss)
+    return out
+
+
+def rsi(closes, n=RSI_LEN):
+    """RSI последней свечи. None, если свечей мало."""
+    s = rsi_series(closes, n)
+    return s[-1] if s else None
+
+
+def sma_series(values, n):
+    """Простая скользящая средняя (ta.sma) для каждой свечи. None, пока свечей не хватает."""
+    out = [None] * len(values)
+    run = 0.0
+    for i, v in enumerate(values):
+        run += v
+        if i >= n:
+            run -= values[i - n]
+        if i >= n - 1:
+            out[i] = run / n
+    return out
+
+
+def atr_last(cs, n=14):
+    """ATR последней свечи по Уайлдеру (ta.atr в TradingView). None, если свечей мало."""
+    if len(cs) < n + 1:
+        return None
+    trs = []
+    for k, x in enumerate(cs):
+        rng = x["h"] - x["l"]
+        if k == 0:
+            trs.append(rng)
+        else:
+            pc = cs[k - 1]["c"]
+            trs.append(max(rng, abs(x["h"] - pc), abs(x["l"] - pc)))
+    a = mean(trs[:n])
+    for t in trs[n:]:
+        a = (a * (n - 1) + t) / n
+    return a
 
 
 def rsi_text(v):
@@ -224,7 +276,7 @@ def get_patterns():
     if hasattr(C, "PATTERN"):
         evening = C.PATTERN == "evening_star"
         return [{"kind": C.PATTERN, "title": C.TITLE, "emoji": C.EMOJI,
-                 "upper_min": C.UPPER_WICK_MIN, "body_max": C.BODY_MAX,
+                 "upper_min": C.UPPER_WICK_MIN, "body_max": C.BODY_MAX, "upper_to_body": 0.0,
                  "lower_min": getattr(C, "LOWER_WICK_MIN", 0.0), "lower_max": C.LOWER_WICK_MAX,
                  "need_green": evening,
                  "skip_green": (not evening) and getattr(C, "NOT_AFTER_BIG_GREEN", False)}]
@@ -232,11 +284,13 @@ def get_patterns():
     if C.FALLING_ENABLED:
         out.append({"kind": "shooting_star", "title": "Падающая звезда", "emoji": "🌠",
                     "upper_min": C.FALLING_UPPER_WICK_MIN, "body_max": C.FALLING_BODY_MAX,
+                    "upper_to_body": cfg("FALLING_UPPER_TO_BODY", 0.0),
                     "lower_min": 0.0, "lower_max": C.FALLING_LOWER_WICK_MAX,
                     "need_green": False, "skip_green": C.FALLING_SKIP_AFTER_BIG_GREEN})
     if C.EVENING_ENABLED:
         out.append({"kind": "evening_star", "title": "Вечерняя звезда", "emoji": "🌇",
                     "upper_min": C.EVENING_UPPER_WICK_MIN, "body_max": C.EVENING_BODY_MAX,
+                    "upper_to_body": 0.0,
                     "lower_min": C.EVENING_LOWER_WICK_MIN, "lower_max": C.EVENING_LOWER_WICK_MAX,
                     "need_green": C.EVENING_REQUIRE_GREEN, "skip_green": False})
     return out
@@ -259,18 +313,58 @@ def star_info(cs, i):
         return None
     top, bottom = max(c["o"], c["c"]), min(c["o"], c["c"])
     body, upper, lower = top - bottom, c["h"] - top, bottom - c["l"]
+    # форма свечи: границы включительно, как в индикаторе (>= и <=)
     fits = [p for p in get_patterns()
-            if upper / rng > p["upper_min"] and body / rng < p["body_max"]
-            and p["lower_min"] <= lower / rng < p["lower_max"]]
+            if upper / rng >= p["upper_min"] and body / rng <= p["body_max"]
+            and upper >= body * p["upper_to_body"]
+            and p["lower_min"] <= lower / rng <= p["lower_max"]]
     if not fits:
         return None
     if C.REQUIRE_RED_BODY and not c["c"] < c["o"]:
         return None
     lb = C.LOCAL_HIGH_LOOKBACK
-    if i < max(lb, 21):
+    if i < max(lb, 21, cfg("SMA_PERIOD", 20) + 1):
         return None
-    if c["h"] < max(x["h"] for x in cs[i - lb:i]):  # звезда - локальный максимум
+    prev_high = max(x["h"] for x in cs[i - lb:i])
+    local_high = c["h"] >= prev_high  # звезда - локальный максимум
+    if cfg("REQUIRE_LOCAL_HIGH", True) and not local_high:
         return None
+
+    # размер свечи относительно ATR: отсекает крошечные свечи на тихом рынке
+    atr_v = atr_last(cs[:i + 1], cfg("ATR_PERIOD", 14))
+    min_atr = cfg("MIN_RANGE_ATR", 0.5)
+    if min_atr > 0 and (atr_v is None or rng < atr_v * min_atr):
+        return None
+
+    # тренд: цена выше SMA, SMA растёт, несколько свечей подряд выше SMA
+    closes = [x["c"] for x in cs[:i + 1]]
+    bars_above = sma_pct = None
+    if cfg("TREND_FILTER", True):
+        sma = sma_series(closes, cfg("SMA_PERIOD", 20))
+        if sma[i] is None or sma[i - 1] is None or not closes[i] > sma[i]:
+            return None
+        if cfg("REQUIRE_RISING_SMA", True) and not sma[i] > sma[i - 1]:
+            return None
+        bars_above, j = 0, i
+        while j >= 0 and sma[j] is not None and closes[j] > sma[j]:
+            bars_above += 1
+            j -= 1
+        if bars_above < cfg("MIN_BARS_ABOVE_SMA", 3):
+            return None
+        sma_pct = (closes[i] / sma[i] - 1) * 100
+
+    # RSI: на звезде (или в одной из последних RSI_LOOKBACK свечей) не ниже порога; ниже порога звезду не учитываем
+    rs = rsi_series(closes)
+    if cfg("RSI_FILTER", True):
+        window = rs[max(0, i - cfg("RSI_LOOKBACK", 1) + 1):i + 1]
+        vals = [v for v in window if v is not None]
+        if not vals or max(vals) < cfg("RSI_MIN", 70):
+            return None
+    if cfg("REQUIRE_DIVERGENCE", False):  # медвежья дивергенция: цена на максимуме, RSI ниже прежнего пика
+        peak = [v for v in rs[i - lb:i] if v is not None]
+        if not local_high or rs[i] is None or not peak or not rs[i] < max(peak):
+            return None
+
     avg_vol = mean([x["v"] for x in cs[i - 20:i]])
     vol_mult = c["v"] / avg_vol if avg_vol > 0 else None
     if C.MIN_VOLUME_MULT > 0 and (vol_mult is None or vol_mult < C.MIN_VOLUME_MULT):
@@ -287,7 +381,8 @@ def star_info(cs, i):
                      "star_vs_prev": body / p_body * 100}
         return {"kind": p["kind"], "title": p["title"], "emoji": p["emoji"],
                 "upper_pct": upper / rng * 100, "body_pct": body / rng * 100, "vol_mult": vol_mult,
-                "rsi_star": rsi([x["c"] for x in cs[:i + 1]]), **extra}
+                "rsi_star": rs[i], "atr_mult": rng / atr_v if atr_v else None,
+                "bars_above": bars_above, "sma_pct": sma_pct, **extra}
     return None
 
 
@@ -358,19 +453,17 @@ def build_message(w, c, bar, close_ts, ctx, stage="final"):
 
 
 def build_star_message(w, cur, now):
-    """Первое сообщение: звезда найдена, падение ещё не подтверждено."""
+    """Сообщение о звезде: приходит сразу после закрытия свечи-звезды."""
     base = w["inst"].split("-")[0]
     star_tf = TF_RU[w["tf"]]
-    level = level_of(w)
-    level_name = "минимума звезды" if C.CONFIRM_LEVEL == "low" else "низа тела звезды"
-    url = f"https://www.tradingview.com/chart/?symbol=OKX:{base}USDT.P&interval={TV_INTERVAL[min(C.CONFIRM_TIMEFRAMES, key=TF_MS.get)]}"
-    end = w["ts"] + 2 * TF_MS[w["tf"]]
-    confirm_tfs = " или ".join(TF_RU[b] for b in C.CONFIRM_TIMEFRAMES)
+    confirm = cfg("CONFIRM_ALERTS", False)
+    interval = TV_INTERVAL[min(C.CONFIRM_TIMEFRAMES, key=TF_MS.get)] if confirm else TV_INTERVAL[w["tf"]]
+    url = f"https://www.tradingview.com/chart/?symbol=OKX:{base}USDT.P&interval={interval}"
 
     lines = [
         f"{emoji_of(w)} <b>{title_of(w)}</b> · {base}/USDT",
         "",
-        "Звезда найдена, падение ещё не началось.",
+        "Звезда найдена, падение ещё не началось." if confirm else f"Свеча-звезда {star_tf} сформировалась.",
         "",
         f"Цена сейчас: {price(cur)} ({fmt_hm(now)}, Ташкент)",
         f"Звезда: {star_tf}, закрылась {fmt_time(w['ts'] + TF_MS[w['tf']])}",
@@ -379,10 +472,31 @@ def build_star_message(w, cur, now):
         lines.append(f"Перед звездой: зелёная свеча {star_tf}, тело ×{w['prev_mult']:.1f} от среднего, "
                      f"тело звезды {w['star_vs_prev']:.0f}% от неё")
     if w.get("rsi_star") is not None:
-        lines.append(f"RSI(14) на звезде {star_tf}: {rsi_text(w['rsi_star'])}")
+        lines.append(f"RSI({RSI_LEN}) на звезде {star_tf}: {rsi_text(w['rsi_star'])}")
+    if w.get("bars_above"):
+        lines.append(f"Тренд: {w['bars_above']} св. подряд выше SMA{cfg('SMA_PERIOD', 20)}, "
+                     f"цена {w['sma_pct']:+.1f}% от неё")
+    size = []
+    if w.get("atr_mult"):
+        size.append(f"размер свечи ×{w['atr_mult']:.1f} от ATR")
     if w.get("vol_mult"):
-        lines.append(f"Объём звезды: ×{w['vol_mult']:.1f} от среднего")
+        size.append(f"объём ×{w['vol_mult']:.1f} от среднего")
+    if size:
+        lines.append("Свеча: " + ", ".join(size))
 
+    if not confirm:
+        lines += [
+            "",
+            f"Максимум звезды: {price(w['h'])} · минимум: {price(w['l'])}",
+            "",
+            f'<a href="{url}">График TradingView</a>',
+        ]
+        return "\n".join(lines)
+
+    level = level_of(w)
+    level_name = "минимума звезды" if C.CONFIRM_LEVEL == "low" else "низа тела звезды"
+    end = w["ts"] + 2 * TF_MS[w["tf"]]
+    confirm_tfs = " или ".join(TF_RU[b] for b in C.CONFIRM_TIMEFRAMES)
     dist = (cur - level) / cur * 100
     if cur < level:
         where = "цена уже ниже, жду закрытия свечи"
@@ -404,20 +518,25 @@ def build_star_message(w, cur, now):
 
 # ---------------------------------------------------------------- Шаги работы
 
-def star_alert(state, key, cur, stats):
-    """Сообщение «звезда найдена». Не чаще одного на монету за COIN_COOLDOWN_HOURS."""
-    w = state["watch"].get(key)
-    if not w or w.get("star_alerted"):
+def star_alert(state, w, cur, stats):
+    """Сообщение «звезда найдена». Одну и ту же свечу бот не объявляет дважды (память seen).
+    Пауза между сообщениями по одной монете и таймфрейму - STAR_COOLDOWN_HOURS (0 = без паузы)."""
+    if w.get("star_alerted"):
         return
     now = now_ms()
-    cool = C.COIN_COOLDOWN_HOURS * 3_600_000
-    for store in ("last_star_alert", "last_alert"):
-        last = state[store].get(w["inst"])
-        if last and now - last < cool:
+    cool_key = f"{w['inst']}|{w['tf']}"
+    cool = cfg("STAR_COOLDOWN_HOURS", 0) * 3_600_000
+    last = state["last_star_alert"].get(cool_key)
+    if cool > 0 and last and now - last < cool:
+        log(f"  {w['inst']} {w['tf']}: недавно уже было сообщение о звезде, не повторяю")
+        return
+    if cfg("CONFIRM_ALERTS", False):  # режим с подтверждением: по монете недавно уже был финальный сигнал
+        last_final = state["last_alert"].get(w["inst"])
+        if last_final and now - last_final < C.COIN_COOLDOWN_HOURS * 3_600_000:
             log(f"  {w['inst']}: по этой монете недавно уже было сообщение, звезду не объявляю")
             return
     if send(build_star_message(w, cur, now)):
-        state["last_star_alert"][w["inst"]] = now
+        state["last_star_alert"][cool_key] = now
         w["star_alerted"] = True
         stats["star_sent"] += 1
         log(f"  ОТПРАВЛЕНО (звезда найдена): {w['inst']} {w['tf']}")
@@ -480,18 +599,22 @@ def scan_new_stars(state, now, stats, new_keys):
                 continue
             c = closed[-1]
             state["seen"][key] = ref_ts
-            state["watch"][key] = {"inst": inst, "tf": tf, "ts": ref_ts, "o": c["o"], "h": c["h"],
-                                   "l": c["l"], "c": c["c"], **info}
-            new_keys.add(key)
+            w = {"inst": inst, "tf": tf, "ts": ref_ts, "o": c["o"], "h": c["h"],
+                 "l": c["l"], "c": c["c"], **info}
+            confirm = cfg("CONFIRM_ALERTS", False)
+            if confirm:  # слежение за подтверждением нужно, только если сообщения о нём включены
+                state["watch"][key] = w
+                new_keys.add(key)
             found += 1
             log(f"  звезда: {inst} {tf} ({info['title']})")
-            if getattr(C, "STAR_ALERT", True):
+            if cfg("STAR_ALERT", True):
                 # цена сейчас - закрытие последней (формирующейся) свечи этого же запроса
                 cur = cs[-1]["c"]
-                if now_ms() >= ref_ts + tf_ms + first_close:
+                if confirm and now_ms() >= ref_ts + tf_ms + first_close:
                     # запуск опоздал: свечи 15м уже закрылись, падение могло начаться - сначала проверка
                     check_watch(state, now_ms(), stats, only={key})
-                star_alert(state, key, cur, stats)
+                if not confirm or key in state["watch"]:  # после финального сообщения звезду уже не объявляем
+                    star_alert(state, w, cur, stats)
         stats["scanned"][tf] = done - failed
         stats["failed"] += failed
         stats["found"] += found
@@ -630,7 +753,10 @@ def main():
              "too_late": 0, "cooldown": 0, "sent": 0, "early_sent": 0, "star_sent": 0, "send_failed": 0}
     new_keys = set()
     try:
-        check_watch(state, now, stats)                      # 1) срочно: звёзды, найденные раньше
+        if cfg("CONFIRM_ALERTS", False):
+            check_watch(state, now, stats)                  # 1) срочно: звёзды, найденные раньше
+        else:
+            state["watch"] = {}                             # подтверждения выключены: старые наблюдения не нужны
         scan_new_stars(state, now, stats, new_keys)         # 2) долго: поиск новых звёзд
         if new_keys:                                        # 3) новые звёзды - вдруг запуск сильно опоздал
             check_watch(state, now_ms(), stats, only=new_keys)
