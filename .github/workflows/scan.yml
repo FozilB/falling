@@ -76,6 +76,14 @@ jobs:
           wait=$(( next - now ))
           echo "Жду ${wait} с до следующего запуска ($(date -d @${next} +%H:%M) UTC)"
           sleep "$wait"
-          gh workflow run scan.yml --ref "${{ github.ref_name }}" \
-            && echo "Следующий запуск поставлен" \
-            || echo "Не удалось поставить следующий запуск (проверьте Settings -> Actions -> General -> Workflow permissions); сработает расписание"
+          # GitHub иногда отвечает ошибкой 5xx (так цепочка уже обрывалась), поэтому пробуем несколько раз
+          for attempt in 1 2 3 4 5 6 7 8; do
+            if gh workflow run scan.yml --ref "${{ github.ref_name }}"; then
+              echo "Следующий запуск поставлен (попытка $attempt)"
+              exit 0
+            fi
+            echo "Попытка $attempt не удалась, повтор через 30 с"
+            sleep 30
+          done
+          echo "Не удалось поставить следующий запуск (проверьте Settings -> Actions -> General -> Workflow permissions). Цепочка оборвана: запустите Scan вручную"
+          exit 1
