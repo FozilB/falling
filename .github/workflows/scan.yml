@@ -14,7 +14,7 @@ on:
         type: boolean
         default: false
 
-# Цепочка ручных запусков продолжает работу с интервалом 15 минут.
+# Цепочка запусков идёт с интервалом 15 минут (каждый запуск сам ставит следующий).
 env:
   RUN_EVERY_MIN: "15"
 
@@ -63,27 +63,34 @@ jobs:
           key: state-${{ github.run_id }}
 
       - name: Следующий запуск (цепочка)
-        # Цепочку продолжает только ручной запуск или следующий workflow_dispatch.
+        # Следующий запуск ставится сразу, пока этот ещё работает: он встаёт в очередь (concurrency)
+        # и начинается, когда этот закончится. Потом ждём ближайшего момента :02/:17/:32/:47 и завершаемся.
+        # Если GitHub остановит раннер во время ожидания, следующий запуск всё равно стартует: цепочка не рвётся.
+        # Цепочку продолжают и запуски по расписанию: после любого обрыва она восстанавливается сама.
         # Тестовые и пробные запуски, а также отменённые вручную, цепочку не продолжают.
-        if: ${{ github.event_name == 'workflow_dispatch' && !cancelled() && !inputs.test_telegram && !inputs.dry_run }}
+        if: ${{ !cancelled() && !inputs.test_telegram && !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          now=$(date +%s)
-          period=$(( RUN_EVERY_MIN * 60 ))
-          next=$(( ( (now - 120 + period - 1) / period ) * period + 120 ))
-          wait=$(( next - now ))
-          echo "Жду ${wait} с до следующего запуска ($(date -d @${next} +%H:%M) UTC)"
-          sleep "$wait"
           # GitHub иногда отвечает ошибкой 5xx (так цепочка уже обрывалась), поэтому пробуем несколько раз
+          queued=0
           for attempt in 1 2 3 4 5 6 7 8; do
             if gh workflow run scan.yml --ref "${{ github.ref_name }}"; then
-              echo "Следующий запуск поставлен (попытка $attempt)"
-              exit 0
+              echo "Следующий запуск поставлен в очередь (попытка $attempt)"
+              queued=1
+              break
             fi
             echo "Попытка $attempt не удалась, повтор через 30 с"
             sleep 30
           done
-          echo "Не удалось поставить следующий запуск (проверьте Settings -> Actions -> General -> Workflow permissions). Цепочка оборвана: запустите Scan вручную"
-          exit 1
+          if [ "$queued" != "1" ]; then
+            echo "Не удалось поставить следующий запуск (проверьте Settings -> Actions -> General -> Workflow permissions). Цепочка оборвана: её восстановит запуск по расписанию или запустите Scan вручную"
+            exit 1
+          fi
+          now=$(date +%s)
+          period=$(( RUN_EVERY_MIN * 60 ))
+          next=$(( ( (now - 120 + period - 1) / period ) * period + 120 ))
+          wait=$(( next - now ))
+          echo "Жду ${wait} с: следующий запуск начнётся в $(date -d @${next} +%H:%M) UTC"
+          sleep "$wait"
