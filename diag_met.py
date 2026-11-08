@@ -93,7 +93,7 @@ def main():
         return
     rows = list(reversed(data))
     cs = [{"ts": int(r[0]), "o": float(r[1]), "h": float(r[2]), "l": float(r[3]), "c": float(r[4]),
-           "v": float(r[5]), "q": float(r[7]), "closed": r[8] == "1"} for r in rows]
+           "v": float(r[5]), "b": float(r[6]), "q": float(r[7]), "closed": r[8] == "1"} for r in rows]
     print(f"получено {len(cs)} свечей 1H: с {hhmm(cs[0]['ts'])} по {hhmm(cs[-1]['ts'])} (Ташкент)")
     idx = {c["ts"]: k for k, c in enumerate(cs)}
 
@@ -111,6 +111,17 @@ def main():
             print(f"\nМонета на момент проверки (приближённо по свечам): цена {S.price(last)}, "
                   f"24ч назад {S.price(open24)} => {((last / open24) - 1) * 100:+.1f}% за сутки; оборот за 24ч ≈ {turn / 1e6:.1f} млн USDT "
                   f"(порог {C.MIN_TURNOVER_USDT / 1e6:g} млн)")
+
+    # --- оборот так, как его считает бот: суточный объём в монетах (volCcy24h) x последняя цена
+    if k is not None and k + 1 < len(cs):
+        print("\nОборот за 24ч для порога 5 млн (как у бота: объём в монетах x цена), варианты окна:")
+        for shift in (-1, 0, 1):
+            e = k + 1 + shift  # конец окна: свеча e - первая не вошедшая
+            win = cs[e - 24:e]
+            base = sum(x["b"] for x in win)
+            for lname, last in (("цена=открытие свечи 00:00", cs[k + 1]["o"]), ("цена=максимум 23:00 (0.306)", cs[k]["h"])):
+                print(f"   окно до {hhmm(cs[e]['ts'])}: монет {base:,.0f} x {last:g} = {base * last / 1e6:.2f} млн USDT ({lname})")
+        print(f"   для сравнения сумма quote-объёма свечей: {sum(x['q'] for x in cs[k + 1 - 24:k + 1]) / 1e6:.2f} млн")
 
     # --- таблица по свечам
     print("\nСвечи MET 1H (время открытия, Ташкент): форма и вердикт бота")
