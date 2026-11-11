@@ -502,6 +502,59 @@ def build_message(w, c, bar, close_ts, ctx, stage="final"):
     return "\n".join(lines)
 
 
+def rsi_drop_info(cs):
+    """RSI-разворот на последней закрытой свече cs[-1]: RSI(14) только что опустился до RSI_ALERT_LOW и ниже,
+    а до этого, пока был выше этого уровня, поднимался до RSI_ALERT_HIGH и выше.
+    Возвращает {"now", "peak", "bars_ago"} или None. Одно и то же падение RSI даёт одно уведомление:
+    срабатывает только на свече, где RSI впервые оказался на уровне LOW или ниже."""
+    hi, lo = cfg("RSI_ALERT_HIGH", 72), cfg("RSI_ALERT_LOW", 68)
+    rs = rsi_series([x["c"] for x in cs])
+    i = len(cs) - 1
+    if i < 1 or rs[i] is None or rs[i - 1] is None:
+        return None
+    if not (rs[i] <= lo and rs[i - 1] > lo):
+        return None
+    peak, peak_j, j = rs[i - 1], i - 1, i - 1
+    while j >= 0 and rs[j] is not None and rs[j] > lo:  # весь участок выше LOW перед этим падением
+        if rs[j] > peak:
+            peak, peak_j = rs[j], j
+        j -= 1
+    if peak < hi:
+        return None
+    return {"now": rs[i], "peak": peak, "bars_ago": i - peak_j}
+
+
+def build_rsi_message(inst, tf, ts, drop, cur, now):
+    base = inst.split("-")[0]
+    star_tf = TF_RU[tf]
+    url = f"https://www.tradingview.com/chart/?symbol=OKX:{base}USDT.P&interval={TV_INTERVAL[tf]}"
+    hi, lo = cfg("RSI_ALERT_HIGH", 72), cfg("RSI_ALERT_LOW", 68)
+    ago = "на прошлой свече" if drop["bars_ago"] == 1 else f"{drop['bars_ago']} св. назад"
+    return "\n".join([
+        f"📉 <b>RSI развернулся вниз</b> · {base}/USDT",
+        "",
+        f"RSI({RSI_LEN}) {star_tf}: поднимался до {drop['peak']:.1f} ({ago}), сейчас {drop['now']:.1f} (ниже {lo:g}).",
+        "",
+        f"Цена сейчас: {price(cur)} ({fmt_hm(now)}, Ташкент)",
+        f"Свеча {star_tf}: закрылась {fmt_time(ts + TF_MS[tf])}",
+        "",
+        f'<a href="{url}">График TradingView</a>',
+    ])
+
+
+def rsi_alert(state, inst, tf, ts, drop, cur, stats):
+    """Уведомление «RSI был не ниже HIGH и опустился до LOW». Одну и ту же свечу не повторяем (память seen)."""
+    key = f"rsi|{inst}|{tf}|{ts}"
+    if key in state["seen"]:
+        return
+    if send(build_rsi_message(inst, tf, ts, drop, cur, now_ms())):
+        state["seen"][key] = ts
+        stats["rsi_sent"] += 1
+        log(f"  ОТПРАВЛЕНО (RSI {drop['peak']:.0f} -> {drop['now']:.0f}): {inst} {tf}")
+    else:
+        stats["send_failed"] += 1
+
+
 def build_star_message(w, cur, now):
     """Сообщение о звезде: приходит сразу после закрытия свечи-звезды."""
     base = w["inst"].split("-")[0]
@@ -620,6 +673,8 @@ def scan_new_stars(state, now, stats, new_keys):
                 stats["errors"] += 1
                 return
         log(f"[{tf}] закрылась свеча {fmt_time(ref_ts)}: проверяю {len(insts)} монет")
+        rsi_on = cfg("RSI_ALERT", False)
+        rsi_tfs = cfg("RSI_ALERT_TIMEFRAMES", C.STAR_TIMEFRAMES)
         done = failed = found = consec = 0
         complete = True
         for inst in insts:
@@ -641,6 +696,10 @@ def scan_new_stars(state, now, stats, new_keys):
             closed = [c for c in cs if c["closed"]]
             if len(closed) < 25 or closed[-1]["ts"] != ref_ts:
                 continue
+            if rsi_on and tf in rsi_tfs:  # уведомление по RSI: свечи уже загружены, лишних запросов нет
+                drop = rsi_drop_info(closed)
+                if drop:
+                    rsi_alert(state, inst, tf, ref_ts, drop, cs[-1]["c"], stats)
             info = star_info(closed, len(closed) - 1)
             if not info:
                 continue
@@ -800,7 +859,7 @@ def main():
     state = load_state()
     now = now_ms()
     stats = {"scanned": {}, "failed": 0, "found": 0, "errors": 0, "expired": 0, "cancelled": 0,
-             "too_late": 0, "cooldown": 0, "sent": 0, "early_sent": 0, "star_sent": 0, "send_failed": 0}
+             "too_late": 0, "cooldown": 0, "sent": 0, "early_sent": 0, "star_sent": 0, "rsi_sent": 0, "send_failed": 0}
     new_keys = set()
     try:
         if cfg("CONFIRM_ALERTS", False):
@@ -814,7 +873,7 @@ def main():
     finally:
         save_state(state)
     log(f"Итог: проверено монет {stats['scanned'] or 'новых свечей нет'}, ошибок запросов {stats['failed']}, "
-        f"новых звёзд {stats['found']} (объявлено {stats['star_sent']}), на наблюдении {len(state['watch'])}, "
+        f"новых звёзд {stats['found']} (объявлено {stats['star_sent']}), RSI-уведомлений {stats['rsi_sent']}, на наблюдении {len(state['watch'])}, "
         f"ранних уведомлений {stats['early_sent']}, финальных подтверждений {stats['sent']}, "
         f"отменено {stats['cancelled']}, не успели {stats['expired']}, слишком поздно {stats['too_late']}, "
         f"повтор по монете {stats['cooldown']}, время работы {(time.time() - T0) / 60:.1f} мин")
