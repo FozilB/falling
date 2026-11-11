@@ -321,30 +321,63 @@ def emoji_of(w):
     return w.get("emoji") or getattr(C, "EMOJI", "⭐")
 
 
+MORIFX_HIGH_BARS = 10  # highest(high, 10) в индикаторе: десять свечей, считая саму звезду
+
+
+def morifx_star(cs, i):
+    """Падающая звезда по правилам индикатора «Hammer & ShootingStar Candle Detector» (MoriFX), строка в строку как его Pine-код:
+      |high - open| > 2 * |open - close|    (верхняя тень от открытия больше двух тел)
+      |high - open| > 2 * |low - close|     (и больше двух нижних теней, считая от закрытия)
+      high >= highest(high, 10)             (максимум не ниже максимумов десяти свечей, считая эту)
+      open <= close[1]                      (открытие не выше закрытия предыдущей свечи)
+    Цвет свечи не важен; «только красная» включается настройкой REQUIRE_RED_BODY."""
+    if i < MORIFX_HIGH_BARS:
+        return False
+    c = cs[i]
+    body = abs(c["o"] - c["c"])
+    s_upper = abs(c["h"] - c["o"])
+    s_lower = abs(c["l"] - c["c"])
+    if not (s_upper > body * 2 and s_upper > s_lower * 2):
+        return False
+    if c["h"] < max(x["h"] for x in cs[i - MORIFX_HIGH_BARS + 1:i + 1]):
+        return False
+    if cfg("MORIFX_OPEN_BELOW_PREV_CLOSE", True) and not c["o"] <= cs[i - 1]["c"]:
+        return False
+    return True
+
+
 def star_info(cs, i):
     """Проверка свечи cs[i] (закрытой). cs - только закрытые свечи, от старых к новым.
-    Возвращает описание звезды (с видом: падающая или вечерняя) или None."""
+    Возвращает описание звезды (с видом: падающая или вечерняя) или None.
+    Правило формы задаёт STAR_RULE: "morifx" (как в индикаторе MoriFX) или "percent" (доли диапазона свечи)."""
     c = cs[i]
     rng = c["h"] - c["l"]
     if rng <= 0:
         return None
     top, bottom = max(c["o"], c["c"]), min(c["o"], c["c"])
     body, upper, lower = top - bottom, c["h"] - top, bottom - c["l"]
-    # форма свечи: границы включительно, как в индикаторе (>= и <=)
-    fits = [p for p in get_patterns()
-            if upper / rng >= p["upper_min"] and body / rng <= p["body_max"]
-            and upper >= body * p["upper_to_body"]
-            and p["lower_min"] <= lower / rng <= p["lower_max"]]
-    if not fits:
-        return None
+    morifx = cfg("STAR_RULE", "percent") == "morifx"
+    if morifx:
+        if not cfg("FALLING_ENABLED", True) or not morifx_star(cs, i):
+            return None
+        fits = [{"kind": "shooting_star", "title": "Падающая звезда", "emoji": "🌠",
+                 "need_green": False, "skip_green": False}]
+    else:
+        # форма свечи: границы включительно, как в индикаторе (>= и <=)
+        fits = [p for p in get_patterns()
+                if upper / rng >= p["upper_min"] and body / rng <= p["body_max"]
+                and upper >= body * p["upper_to_body"]
+                and p["lower_min"] <= lower / rng <= p["lower_max"]]
+        if not fits:
+            return None
     if C.REQUIRE_RED_BODY and not c["c"] < c["o"]:
         return None
     lb = C.LOCAL_HIGH_LOOKBACK
     if i < max(lb, 21, cfg("SMA_PERIOD", 20) + 1):
         return None
     prev_high = max(x["h"] for x in cs[i - lb:i])
-    local_high = c["h"] >= prev_high  # звезда - локальный максимум
-    if cfg("REQUIRE_LOCAL_HIGH", True) and not local_high:
+    local_high = True if morifx else c["h"] >= prev_high  # звезда - локальный максимум (в правиле MoriFX это уже проверено)
+    if not morifx and cfg("REQUIRE_LOCAL_HIGH", True) and not local_high:
         return None
 
     # размер свечи относительно ATR: отсекает крошечные свечи на тихом рынке
