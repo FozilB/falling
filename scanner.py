@@ -360,6 +360,10 @@ def star_info(cs, i):
     if morifx:
         if not cfg("FALLING_ENABLED", True) or not morifx_star(cs, i):
             return None
+        # нижняя тень не больше доли диапазона свечи (в индикаторе MoriFX такой проверки нет; 0 = не проверять)
+        max_lower = cfg("MORIFX_LOWER_WICK_MAX", 0)
+        if max_lower > 0 and lower / rng > max_lower:
+            return None
         fits = [{"kind": "shooting_star", "title": "Падающая звезда", "emoji": "🌠",
                  "need_green": False, "skip_green": False}]
     else:
