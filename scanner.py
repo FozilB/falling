@@ -1,4 +1,4 @@
-"""Сканер OKX: падающая звезда на 1ч/4ч -> сообщение в Telegram сразу после закрытия свечи.
+"""Сканер OKX: падающая звезда (и молот, HAMMER_ENABLED) на 1ч -> сообщение в Telegram сразу после закрытия свечи.
 
 Правила звезды перенесены из индикатора TradingView «Shooting Star Strategy Helper v3»:
   форма свечи (тело, верхняя и нижняя тень, верхняя тень >= 2 тел), размер не меньше 0.5 ATR,
@@ -238,15 +238,26 @@ def top_instruments():
     rows.sort(key=lambda r: r[0], reverse=True)
     all_n = len(rows)
     rows = [r for r in rows if r[0] >= cfg("MIN_TURNOVER_USDT", 0)]
+    liquid = rows
     liquid_n = len(rows)
     if cfg("ONLY_RISING", False):
         min_change = cfg("MIN_24H_CHANGE_PCT", 0.0)
         rows = [r for r in rows if r[2] is not None and r[2] >= min_change]
         log(f"Монет всего {all_n}, с оборотом от {cfg('MIN_TURNOVER_USDT', 0):,.0f} USDT за сутки {liquid_n}, "
-            f"из них выросло за сутки не меньше чем на {min_change:g}%: {len(rows)} (проверяю не больше {C.TOP_COINS})")
+            f"из них выросло за сутки не меньше чем на {min_change:g}%: {len(rows)} (для звезды проверяю не больше {C.TOP_COINS})")
     else:
-        log(f"Монет всего {all_n}, с достаточным оборотом {liquid_n} (проверяю не больше {C.TOP_COINS})")
-    return [inst for _, inst, _ in rows[:C.TOP_COINS]]
+        log(f"Монет всего {all_n}, с достаточным оборотом {liquid_n} (для звезды проверяю не больше {C.TOP_COINS})")
+    out = {}  # монета -> что на ней искать: {"star"}, {"hammer"} или оба
+    if cfg("FALLING_ENABLED", True):
+        for _, inst, _ in rows[:C.TOP_COINS]:
+            out.setdefault(inst, set()).add("star")
+    if cfg("HAMMER_ENABLED", False):
+        max_change = cfg("HAMMER_MAX_24H_CHANGE_PCT", 0.0)
+        falling = [r for r in liquid if r[2] is not None and r[2] <= max_change][:cfg("HAMMER_TOP_COINS", 60)]
+        log(f"Для молота: упало за сутки (изменение не выше {max_change:g}%) {len(falling)} монет")
+        for _, inst, _ in falling:
+            out.setdefault(inst, set()).add("hammer")
+    return list(out.items())
 
 
 # ---------------------------------------------------------------- Telegram
@@ -344,6 +355,58 @@ def morifx_star(cs, i):
     if cfg("MORIFX_OPEN_BELOW_PREV_CLOSE", True) and not c["o"] <= cs[i - 1]["c"]:
         return False
     return True
+
+
+def morifx_hammer(cs, i):
+    """Молот по правилам того же индикатора MoriFX, строка в строку как его Pine-код:
+      |low - open| > 2 * |open - close|     (нижняя тень от открытия больше двух тел)
+      |low - open| > 2 * |high - close|     (и больше двух верхних теней, считая от закрытия)
+      low <= lowest(low, 10)                (минимум не выше минимумов десяти свечей, считая эту)
+      close <= open[1]                      (закрытие не выше открытия предыдущей свечи)
+    Цвет свечи не важен."""
+    if i < MORIFX_HIGH_BARS:
+        return False
+    c = cs[i]
+    body = abs(c["o"] - c["c"])
+    h_lower = abs(c["l"] - c["o"])
+    h_upper = abs(c["h"] - c["c"])
+    if not (h_lower > body * 2 and h_lower > h_upper * 2):
+        return False
+    if c["l"] > min(x["l"] for x in cs[i - MORIFX_HIGH_BARS + 1:i + 1]):
+        return False
+    if not c["c"] <= cs[i - 1]["o"]:
+        return False
+    return True
+
+
+def hammer_info(cs, i):
+    """Молот на закрытой свече cs[i] + фильтры из config.py (HAMMER_*). Возвращает описание или None.
+    Проверка 04–17.11.2026 (150 монет, 1ч): без фильтров молот был в минусе, фильтры звезды (объём, размер) делали хуже;
+    в плюсе только сильная перепроданность — RSI(14) не выше 25 на молоте или двух свечах до него."""
+    if i < 21 or not morifx_hammer(cs, i):
+        return None
+    c = cs[i]
+    rng = c["h"] - c["l"]
+    if rng <= 0:
+        return None
+    closes = [x["c"] for x in cs[:i + 1]]
+    rs = rsi_series(closes)
+    window = [v for v in rs[max(0, i - cfg("HAMMER_RSI_LOOKBACK", 3) + 1):i + 1] if v is not None]
+    rsi_max = cfg("HAMMER_RSI_MAX", 25)
+    if rsi_max < 100 and (not window or min(window) > rsi_max):
+        return None
+    avg_vol = mean([x["v"] for x in cs[i - 20:i]])
+    vol_mult = c["v"] / avg_vol if avg_vol > 0 else None
+    min_vol = cfg("HAMMER_MIN_VOLUME_MULT", 0)
+    if min_vol > 0 and (vol_mult is None or vol_mult < min_vol):
+        return None
+    atr_v = atr_last(cs[:i + 1], cfg("ATR_PERIOD", 14))
+    min_atr = cfg("HAMMER_MIN_RANGE_ATR", 0)
+    if min_atr > 0 and (atr_v is None or rng < atr_v * min_atr):
+        return None
+    return {"kind": "hammer", "title": "Молот", "emoji": "🔨", "rsi_star": rs[i],
+            "rsi_min": min(window) if window else None, "vol_mult": vol_mult,
+            "atr_mult": rng / atr_v if atr_v else None}
 
 
 def star_info(cs, i):
@@ -651,6 +714,54 @@ def star_alert(state, w, cur, stats):
         stats["send_failed"] += 1
 
 
+def build_hammer_message(w, cur, now):
+    """Сообщение о молоте (сигнал на возможный рост): приходит сразу после закрытия свечи-молота."""
+    base = w["inst"].split("-")[0]
+    tf = TF_RU[w["tf"]]
+    url = f"https://www.tradingview.com/chart/?symbol=OKX:{base}USDT.P&interval={TV_INTERVAL[w['tf']]}"
+    lines = [
+        f"{w['emoji']} <b>Молот</b> · {base}/USDT · 🟢 на рост",
+        "",
+        f"Свеча-молот {tf} сформировалась. Экспериментальный сигнал: молот проверен хуже звезды.",
+        "",
+        f"Цена сейчас: {price(cur)} ({fmt_hm(now)}, Ташкент)",
+        f"Молот: {tf}, закрылась {fmt_time(w['ts'] + TF_MS[w['tf']])}",
+    ]
+    if w.get("rsi_star") is not None:
+        lines.append(f"RSI({RSI_LEN}) на молоте {tf}: {rsi_text(w['rsi_star'])}")
+    size = []
+    if w.get("atr_mult"):
+        size.append(f"размер свечи ×{w['atr_mult']:.1f} от ATR")
+    if w.get("vol_mult"):
+        size.append(f"объём ×{w['vol_mult']:.1f} от среднего")
+    if size:
+        lines.append("Свеча: " + ", ".join(size))
+    lines += [
+        "",
+        f"Минимум молота: {price(w['l'])} · максимум: {price(w['h'])}",
+        "",
+        f'<a href="{url}">График TradingView</a>',
+    ]
+    return "\n".join(lines)
+
+
+def hammer_alert(state, w, cur, stats):
+    """Сообщение о молоте. Пауза между сообщениями по одной монете - HAMMER_COOLDOWN_HOURS (0 = без паузы)."""
+    now = now_ms()
+    cool_key = f"{w['inst']}|{w['tf']}|hammer"
+    cool = cfg("HAMMER_COOLDOWN_HOURS", 0) * 3_600_000
+    last = state["last_star_alert"].get(cool_key)
+    if cool > 0 and last and now - last < cool:
+        log(f"  {w['inst']} {w['tf']}: недавно уже было сообщение о молоте, не повторяю")
+        return
+    if send(build_hammer_message(w, cur, now)):
+        state["last_star_alert"][cool_key] = now
+        stats["hammer_sent"] += 1
+        log(f"  ОТПРАВЛЕНО (молот): {w['inst']} {w['tf']}")
+    else:
+        stats["send_failed"] += 1
+
+
 def scan_new_stars(state, now, stats, new_keys):
     insts = None
     for tf in C.STAR_TIMEFRAMES:
@@ -681,7 +792,7 @@ def scan_new_stars(state, now, stats, new_keys):
         rsi_tfs = cfg("RSI_ALERT_TIMEFRAMES", C.STAR_TIMEFRAMES)
         done = failed = found = consec = 0
         complete = True
-        for inst in insts:
+        for inst, kinds in insts:
             if time.time() - T0 > BUDGET_S:
                 log(f"[{tf}] лимит времени запуска исчерпан после {done} монет")
                 complete = False
@@ -704,6 +815,18 @@ def scan_new_stars(state, now, stats, new_keys):
                 drop = rsi_drop_info(closed)
                 if drop:
                     rsi_alert(state, inst, tf, ref_ts, drop, cs[-1]["c"], stats)
+            if "hammer" in kinds:  # молот: свечи уже загружены, лишних запросов нет
+                h_info = hammer_info(closed, len(closed) - 1)
+                h_key = f"{inst}|{tf}|{ref_ts}|hammer"
+                if h_info and h_key not in state["seen"]:
+                    state["seen"][h_key] = ref_ts
+                    c = closed[-1]
+                    stats["hammers"] += 1
+                    log(f"  молот: {inst} {tf}")
+                    hammer_alert(state, {"inst": inst, "tf": tf, "ts": ref_ts, "o": c["o"], "h": c["h"],
+                                         "l": c["l"], "c": c["c"], **h_info}, cs[-1]["c"], stats)
+            if "star" not in kinds:
+                continue
             info = star_info(closed, len(closed) - 1)
             if not info:
                 continue
@@ -863,7 +986,8 @@ def main():
     state = load_state()
     now = now_ms()
     stats = {"scanned": {}, "failed": 0, "found": 0, "errors": 0, "expired": 0, "cancelled": 0,
-             "too_late": 0, "cooldown": 0, "sent": 0, "early_sent": 0, "star_sent": 0, "rsi_sent": 0, "send_failed": 0}
+             "too_late": 0, "cooldown": 0, "sent": 0, "early_sent": 0, "star_sent": 0, "rsi_sent": 0, "send_failed": 0,
+             "hammers": 0, "hammer_sent": 0}
     new_keys = set()
     try:
         if cfg("CONFIRM_ALERTS", False):
@@ -877,7 +1001,7 @@ def main():
     finally:
         save_state(state)
     log(f"Итог: проверено монет {stats['scanned'] or 'новых свечей нет'}, ошибок запросов {stats['failed']}, "
-        f"новых звёзд {stats['found']} (объявлено {stats['star_sent']}), RSI-уведомлений {stats['rsi_sent']}, на наблюдении {len(state['watch'])}, "
+        f"новых звёзд {stats['found']} (объявлено {stats['star_sent']}), молотов {stats['hammers']} (объявлено {stats['hammer_sent']}), RSI-уведомлений {stats['rsi_sent']}, на наблюдении {len(state['watch'])}, "
         f"ранних уведомлений {stats['early_sent']}, финальных подтверждений {stats['sent']}, "
         f"отменено {stats['cancelled']}, не успели {stats['expired']}, слишком поздно {stats['too_late']}, "
         f"повтор по монете {stats['cooldown']}, время работы {(time.time() - T0) / 60:.1f} мин")
